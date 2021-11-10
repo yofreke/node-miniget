@@ -2,6 +2,10 @@ import { RequestOptions, IncomingMessage, ClientRequest, default as http } from 
 import { EventEmitter } from 'events';
 import https from 'https';
 import { PassThrough, Transform } from 'stream';
+// TODO: Should probably move this to a peerDependency, and dynamically load.
+// This will also help to avoid multiple module installations interfering (since
+// CookieAccessInfo is a Symbol).
+import { CookieAccessInfo } from 'cookiejar';
 
 
 const httpLibs: {
@@ -25,6 +29,8 @@ namespace Miniget {
     highWaterMark?: number;
     transform?: (parsedUrl: RequestOptions) => RequestOptions;
     acceptEncoding?: { [key: string]: () => Transform };
+    // TODO: Add types
+    cookieJar?: any;
   }
 
   export interface DefaultOptions extends Options {
@@ -97,6 +103,17 @@ function Miniget(url: string | URL, options: Miniget.Options = {}): Miniget.Stre
     }, opts.headers);
   }
 
+  const urlParsed = new URL(url);
+  if (opts.cookieJar) {
+    opts.headers = opts.headers || {};
+    // TODO: Get rid of dependency on CookieAccessInfo
+    opts.headers.Cookie = opts.cookieJar.getCookies(CookieAccessInfo.All).toValueString();
+    console.log('miniget: Using cookies:', opts.headers.Cookie);
+
+    // Hack to include custom headers
+    opts.headers['User-Agent'] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.81 Safari/537.36";
+  }
+
   const downloadHasStarted = () => activeDecodedStream && downloaded > 0;
   const downloadComplete = () => !acceptRanges || downloaded === contentLength;
 
@@ -105,6 +122,7 @@ function Miniget(url: string | URL, options: Miniget.Options = {}): Miniget.Stre
     retries = 0;
     let inc = opts.backoff.inc;
     let ms = Math.min(inc, opts.backoff.max);
+    console.log('miniget: reconnect in ms=', ms);
     retryTimeout = setTimeout(doDownload, ms);
     stream.emit('reconnect', reconnects, err);
   };
@@ -130,6 +148,7 @@ function Miniget(url: string | URL, options: Miniget.Options = {}): Miniget.Stre
       retries++ < opts.maxRetries) {
       let ms = retryOptions.retryAfter ||
         Math.min(retries * opts.backoff.inc, opts.backoff.max);
+      console.log('miniget: retry in ms=', ms);
       retryTimeout = setTimeout(doDownload, ms);
       stream.emit('retry', retries, retryOptions.err);
       return true;
@@ -144,6 +163,7 @@ function Miniget(url: string | URL, options: Miniget.Options = {}): Miniget.Stre
   };
 
   const doDownload = () => {
+    console.log('miniget: doDownload:', url);
     let parsed: RequestOptions = {}, httpLib;
     try {
       let urlObj = typeof url === 'string' ? new URL(url) : url;
@@ -192,6 +212,7 @@ function Miniget(url: string | URL, options: Miniget.Options = {}): Miniget.Stre
     }
 
     const onError = (err: Miniget.MinigetError): void => {
+      // console.log('debug: miniget: activeStream onError', err);
       if (stream.destroyed || stream.readableEnded) { return; }
       cleanup();
       if (!retryRequest({ err })) {
@@ -202,35 +223,58 @@ function Miniget(url: string | URL, options: Miniget.Options = {}): Miniget.Stre
     };
 
     const onRequestClose = () => {
+      // console.log('debug: miniget: activeStream onRequestClose');
       cleanup();
       retryRequest({});
     };
 
     const cleanup = () => {
+      // console.log('debug: miniget: activeStream cleanup');
       activeRequest.removeListener('close', onRequestClose);
       activeResponse?.removeListener('data', onData);
       activeDecodedStream?.removeListener('end', onEnd);
+      // console.log('debug: miniget: activeStream cleanup complete');
     };
 
     const onData = (chunk: Buffer) => { downloaded += chunk.length; };
 
     const onEnd = () => {
+      // console.log('debug: miniget: activeStream onEnd');
       cleanup();
       if (!reconnectIfEndedEarly()) {
         stream.end();
       }
+      // console.log('debug: miniget: activeStream onEnd complete');
     };
+
+    // console.log("miniget: making request:", parsed);
 
     activeRequest = httpLib.request(parsed, (res: IncomingMessage) => {
       // Needed for node v10, v12.
       // istanbul ignore next
       if (stream.destroyed) { return; }
+
+      if (opts.cookieJar && res.headers['set-cookie']) {
+        console.log('miniget: Setting cookies:', res.headers['set-cookie']);
+        opts.cookieJar.setCookies(res.headers['set-cookie'], { domain: urlParsed.host, path: urlParsed.pathname });
+      }
+
       if (redirectStatusCodes.has(res.statusCode as number)) {
+        console.log('miniget: redirect url=', url, 'new=', res.headers.location);
+        // console.log('>> res=', res);
         if (redirects++ >= opts.maxRedirects) {
           stream.emit('error', new Miniget.MinigetError('Too many redirects'));
         } else {
           if (res.headers.location) {
             url = res.headers.location;
+
+            // Ensure url is parsable
+            try {
+              const _testUrl = new URL(url);
+            } catch (error) {
+              url = new URL(res.headers.location, urlParsed.origin);
+              console.log('>> Using adjusted location:', url.href);
+            }
           } else {
             let err = new Miniget.MinigetError('Redirect status code given with no location', res.statusCode);
             stream.emit('error', err);
@@ -277,6 +321,8 @@ function Miniget(url: string | URL, options: Miniget.Options = {}): Miniget.Stre
         acceptRanges = res.headers['accept-ranges'] === 'bytes' &&
           contentLength > 0 && opts.maxReconnects > 0;
       }
+
+      // console.log('debug: miniget: Finalizing handlers');
       res.on('data', onData);
       activeDecodedStream.on('end', onEnd);
       activeDecodedStream.pipe(stream, { end: !acceptRanges });
@@ -284,7 +330,10 @@ function Miniget(url: string | URL, options: Miniget.Options = {}): Miniget.Stre
       stream.emit('response', res);
       res.on('error', onError);
       forwardEvents(res, responseEvents);
+      // console.log('debug: miniget: Finalizing handlers complete');
     });
+
+    // console.log('debug: miniget: Finalizing activeRequest');
     activeRequest.on('error', onError);
     activeRequest.on('close', onRequestClose);
     forwardEvents(activeRequest, requestEvents);
@@ -293,9 +342,11 @@ function Miniget(url: string | URL, options: Miniget.Options = {}): Miniget.Stre
     }
     stream.emit('request', activeRequest);
     activeRequest.end();
+    // console.log('debug: miniget: Finalizing activeRequest complete');
   };
 
   stream.abort = (err?: Error) => {
+    // console.log('debug: miniget: abort', error);
     console.warn('`MinigetStream#abort()` has been deprecated in favor of `MinigetStream#destroy()`');
     stream.aborted = true;
     stream.emit('abort');
@@ -304,10 +355,12 @@ function Miniget(url: string | URL, options: Miniget.Options = {}): Miniget.Stre
 
   let destroyArgs: any[];
   const streamDestroy = (err?: Error) => {
+    // console.log('debug: miniget: streamDestroy', error);
     activeRequest.destroy(err);
     activeDecodedStream?.unpipe(stream);
     activeDecodedStream?.destroy();
     clearTimeout(retryTimeout);
+    // console.log('debug: miniget: streamDestroy complete');
   };
 
   stream._destroy = (...args: any[]) => {
